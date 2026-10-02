@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 > DataPilot 项目的 Claude Code 上下文基础文件：后续所有会话开工前，先读「重要约束」与「代码规范」。
-> 当前状态：llm 工厂、RAG、工具集、Agent 核心与 API 路由层（对话 / 知识库 / 模型 / 健康检查，test_api.py 全链路验证）均已实现并联网验证通过；前端页面待填充。
+> 当前状态：llm 工厂、RAG、工具集、Agent 核心与 API 路由层（对话 / 知识库 / 模型 / 健康检查，test_api.py 全链路验证）均已实现并联网验证通过；前端脚手架与对话页（ChatView：SSE 流式 / 推理面板 / 会话管理，Edge headless 浏览器全流程验证通过）已实现；知识库与设置页为空壳。
 
 ## 1. 项目概述
 
@@ -23,8 +23,8 @@ DataPilot 是基于 LangChain Agent + RAG 的智能数据分析助手（单机�
 | 向量库 | `chromadb` + `langchain-chroma`（本地持久化） |
 | 文档解析 | `pypdfium2` + `pymupdf`（PDF）；`python-docx`（Word，待补装）、`pandas`（CSV/Excel，待补装） |
 | 文本分割 | `langchain-text-splitters` |
-| 前端 | Vue 3 + TypeScript + Vite 8 + Element Plus + Pinia + vue-router + ECharts + markdown-it / highlight.js |
-| 流式 | SSE（服务端 sse-starlette，已装；客户端 POST + fetch ReadableStream） |
+| 前端 | Vue 3 + TypeScript + Vite 8 + Element Plus + Pinia + vue-router + ECharts + marked / highlight.js |
+| 流式 | SSE（服务端 sse-starlette；客户端 @microsoft/fetch-event-source，EventSource 不支持 POST） |
 | 包管理 | 后端 uv（阿里云 PyPI 镜像）；前端 npm |
 
 ## 3. 目录结构说明
@@ -59,8 +59,13 @@ DataPilot/
     └── src/
         ├── main.ts  App.vue  vite-env.d.ts
         ├── router/index.ts        # /（对话）、/knowledge（知识库）、/settings（设置）
-        ├── api/request.ts         # axios 实例（SSE 客户端后续加 chat.ts）
-        └── views/                 # ChatView / KnowledgeView / SettingsView（空壳）
+        ├── api/request.ts         # axios 实例（baseURL /api + 拦截器）
+        ├── api/chat.ts            # SSE 客户端（fetch-event-source；事件契约解析集中于此）
+        ├── api/models.ts          # GET /api/models 封装
+        ├── stores/chat.ts         # pinia：会话 / 消息 / 流式状态（会话由前端自管）
+        ├── utils/markdown.ts      # marked + highlight.js 渲染（原始 HTML 转义）
+        ├── components/            # SessionList / MessageItem / ReasoningPanel / ChatInput
+        └── views/                 # ChatView（已实现）；KnowledgeView / SettingsView（空壳）
 ```
 
 注意：`back/src/` 下是扁平模块（`main.py`、`config.py` 与各包平级；src 为源代码根、不是包，不要加 `__init__.py`），导入仍直接写 `from config import settings`、`from llm import get_model`；运行时数据与 `.env` 留在 `back/` 根（`config.BASE_DIR`）。新增顶层模块时避免与第三方包重名。
@@ -105,8 +110,8 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
 
 ### Vue（Composition API + TypeScript）
 
-- 一律 `<script setup lang="ts">` 组合式 API；全局状态进 pinia（`stores/`，后续创建），组件不直接发请求
-- 请求集中在 `src/api/`；SSE 解析只在 `api/chat.ts` 实现（fetch + ReadableStream，EventSource 不支持 POST）
+- 一律 `<script setup lang="ts">` 组合式 API；全局状态进 pinia（`stores/`），组件不直接发请求
+- 请求集中在 `src/api/`；SSE 解析只在 `api/chat.ts` 实现（@microsoft/fetch-event-source，EventSource 不支持 POST）
 - 组件文件 PascalCase（`MessageItem.vue`），视图 `XxxView.vue`；Element Plus 全量引入（tsconfig 已配 `element-plus/global` 类型），图标按需 `import`，不引入其他 UI 库
 - 样式 scoped；图表统一走 `ChartCard` 组件；提交前跑 `npm run type-check` 与 `npm run build`
 - TypeScript 保持 ^5（vue-tsc 3.x 不兼容 TS 7）
@@ -211,6 +216,8 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
 - `create_agent` 的 `ainvoke`/`astream` 返回 LangGraph 状态（`{"messages": [...]}`），没有 AgentExecutor 式的 `intermediate_steps`：工具步骤需自行从消息序列提取（按 id 配对 AIMessage.tool_calls 与 ToolMessage，见 `agent._extract_steps`；输出为 `[{tool, input, output}]`）
 - 知识库上传接口的幂等与列表实现：同名文件重传先 `RagService.delete_document`（`store.get(where={"source": ...})` 取 ids → `store.delete(ids=ids)`）再入库；列表聚合用 `store.get(include=["metadatas"])`——两者均为 langchain-chroma 公开接口（勿碰 `_collection` 私有属性）
 - SSE 裸报文格式：`EventSourceResponse` 输出 `event:` / `data:` 行 + 空行分隔，`data` 需自行 `json.dumps(ensure_ascii=False)`；默认每 15s 发 `: ping` 注释行（前端解析需忽略 `:` 开头行）。Windows Git Bash 向系统 curl 传中文 JSON 参数会乱码（报 FastAPI「error parsing the body」）：改用 `printf + --data-binary @-`，或直接用 httpx（test_api.py）验证
+- `@microsoft/fetch-event-source`：`onerror` 回调必须 `throw`（返回非 undefined 会被当作重试间隔，POST 流式请求重放会导致消息重复）；`openWhenHidden: true` 防止标签页隐藏时 abort；自定义 `onopen` 会替换默认的 content-type 检查；signal abort 后 promise 是 resolve 而非 reject，调用方需以 `signal.aborted` 区分「手动停止」与异常
+- Vue 响应式：`push` 进 reactive 数组后的对象必须重新从数组读取（拿代理）再修改，否则流式增量更新不触发重渲染
 - `python_executor` 是受限命名空间而非安全沙箱：白名单 builtins + AST 拒绝 import / 双下划线名称与属性；numpy/pandas 的 C 扩展会在调用帧内懒加载 import（帧内无 `__import__` 会报 `KeyError: '__import__'`），故注入 `_guarded_import` 仅放行 numpy/pandas 子模块；无超时控制（死循环会挂住工作线程），pandas 注入后其内部 IO（read_csv 等）不受语言层限制，数据集阶段需在工具层约束路径
 - 在 `back/.venv` 内检索已装库源码时，Grep 工具会因 `.gitignore` 忽略 `.venv/` 而搜不到：改用 Bash `grep` 或指定具体文件路径（指定文件不受忽略规则影响）
 - Windows 控制台默认 GBK 编码，中文输出乱码：入口脚本已对 stdout/stderr 强制 UTF-8（`sys.stdout.reconfigure`）；后续新增打印中文的脚本照做，终端仍乱码则用 `chcp 65001` 或 Windows Terminal

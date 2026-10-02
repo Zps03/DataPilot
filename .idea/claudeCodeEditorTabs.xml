@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ClaudeCodeEditorTabs">
-    <option name="activeSessionId" value="546749e1-3484-4ec4-8aca-6c0215ee73b3" />
+    <option name="activeSessionId" value="a53a4551-af34-44a2-8fe5-464679e9f3ae" />
     <option name="openSessionIds">
       <list>
         <option value="0dbcdda0-01cf-4e73-b6e4-9be851634ea8" />
         <option value="5f2a1b37-daf1-497c-9200-c5549673c781" />
         <option value="546749e1-3484-4ec4-8aca-6c0215ee73b3" />
+        <option value="a53a4551-af34-44a2-8fe5-464679e9f3ae" />
       </list>
     </option>
     <option name="sessionPaths">
@@ -14,6 +15,7 @@
         <entry key="0dbcdda0-01cf-4e73-b6e4-9be851634ea8" value="/sessions/2d2f54c9-fba7-4f92-b8a1-d4d36491522b" />
         <entry key="546749e1-3484-4ec4-8aca-6c0215ee73b3" value="/sessions/8cab7d87-44c0-4858-81cb-70b91ae201ea" />
         <entry key="5f2a1b37-daf1-497c-9200-c5549673c781" value="/sessions/8cab7d87-44c0-4858-81cb-70b91ae201ea" />
+        <entry key="a53a4551-af34-44a2-8fe5-464679e9f3ae" value="/sessions/7004ce1e-73aa-4ce0-bdbd-480a087b3a0c" />
       </map>
     </option>
     <option name="sessionTitles">
@@ -21,6 +23,7 @@
         <entry key="0dbcdda0-01cf-4e73-b6e4-9be851634ea8" value="你是谁？" />
         <entry key="546749e1-3484-4ec4-8aca-6c0215ee73b3" value="我要创建一个基于 LangChain Agent + RAG 的智能数据分析助手项目，技术栈如下：" />
         <entry key="5f2a1b37-daf1-497c-9200-c5549673c781" value="我要创建一个基于 LangChain Agent + RAG 的智能数据分析助手项目，技术栈如下：" />
+        <entry key="a53a4551-af34-44a2-8fe5-464679e9f3ae" value="请实现 front/ 目录下的 Vue 3 前端： 1. front/package.json 依" />
       </map>
     </option>
   </component>
