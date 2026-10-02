@@ -39,6 +39,11 @@ const route = useRoute()
   border-right: 1px solid var(--el-border-color-light);
 }
 
+/* 导航边框由 aside 提供，去掉 el-menu 自带右边框避免双线 */
+.app-aside :deep(.el-menu) {
+  border-right: none;
+}
+
 .app-logo {
   padding: 16px;
   font-size: 18px;
