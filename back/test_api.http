@@ -1,0 +1,7 @@
+# DataPilot API 调试脚本（PyCharm HTTP Client）
+# 启动后端：cd back && uv run uvicorn main:app --app-dir src --reload --port 8000
+
+GET http://127.0.0.1:8000/api/health
+Accept: application/json
+
+###

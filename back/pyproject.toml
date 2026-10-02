@@ -1,0 +1,52 @@
+[project]
+name = "datapilot"
+version = "0.1.0"
+description = "DataPilot：基于 LangChain Agent + RAG 的智能数据分析助手（后端）"
+authors = [
+    { name = "Zps03", email = "3491482232@qq.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "httpx-sse>=0.4.3",
+    "langchain>=1.4.2",
+    "langchain-chroma>=1.1.0",
+    "langchain-core>=1.6.3",
+    "langchain-openai>=1.6.2",
+    "langchain-text-splitters>=1.1.2",
+    "numpy>=2.5.3",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.6",
+    "pydantic-settings>=2.15.0",
+    "pymupdf>=1.28.2",
+    "pypdfium2>=5.13.0",
+    "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.32",
+    "sse-starlette>=3.5.0",
+    "uvicorn[standard]>=0.53.0",
+]
+
+[tool.uv]
+# 应用项目（非库），不需要 build-system 与自身安装
+package = false
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]  # pytest 从 back/ 运行时，将源代码根加入导入路径
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.8",
+]

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# 环境与数据
+.env
+back/data/
+back/chroma_db/
+back/knowledge_docs/
+
+# Node
+node_modules/
+dist/
+
+# 系统
+.DS_Store
+Thumbs.db
