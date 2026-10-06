@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 > DataPilot 项目的 Claude Code 上下文基础文件：后续所有会话开工前，先读「重要约束」与「代码规范」。
-> 当前状态：llm 工厂、RAG、工具集、Agent 核心与 API 路由层（对话 / 知识库 / 模型 / 健康检查，test_api.py 全链路验证）均已实现并联网验证通过；前端脚手架与对话页（ChatView：SSE 流式 / 推理面板 / 会话管理，Edge headless 浏览器全流程验证通过）已实现；知识库与设置页为空壳。
+> 当前状态：llm 工厂、RAG（含检索测试接口，cosine 度量）、工具集、Agent 核心与 API 路由层（对话 / 知识库 / 模型 / 健康检查，test_api.py 全链路验证）均已实现并联网验证通过；前端脚手架、对话页（ChatView：SSE 流式 / 推理面板 / 会话管理）与知识库页（KnowledgeView：拖拽上传 / 文档列表 / 检索测试 / 删除清空，Edge headless 浏览器全流程验证通过）已实现；设置页为空壳。
 
 ## 1. 项目概述
 
@@ -47,7 +47,7 @@ DataPilot/
 │       ├── test_rag.py            # RAG 测试脚本（解析/切分离线验证 + 入库/检索联网验证）
 │       ├── test_agent.py          # Agent 测试脚本（多步推理事件流 + run 契约 + 多轮记忆）
 │       ├── test_tools.py          # 工具测试脚本（计算器 / 代码执行 / 时间 / 知识库检索）
-│       ├── test_api.py            # API 测试脚本（需先启动后端；httpx 全链路：路由 / 上传 / 对话 / SSE）
+│       ├── test_api.py            # API 测试脚本（需先启动后端；httpx 全链路：路由 / 上传 / 检索 / 删除 / 对话 / SSE）
 │       ├── llm/                   # 模型工厂：get_model / get_embeddings（已实现）
 │       ├── rag/                   # RAG：pypdfium2 解析 → 切分 → Chroma 入库与检索（RagService，已实现）
 │       ├── agent/                 # create_agent 组装 + DataAnalysisAgent 类封装 + 系统提示词；events.py 事件流适配（均已实现）
@@ -61,11 +61,12 @@ DataPilot/
         ├── router/index.ts        # /（对话）、/knowledge（知识库）、/settings（设置）
         ├── api/request.ts         # axios 实例（baseURL /api + 拦截器）
         ├── api/chat.ts            # SSE 客户端（fetch-event-source；事件契约解析集中于此）
+        ├── api/knowledge.ts       # 知识库接口封装（上传进度 / 列表 / 检索 / 删除 / 清空）
         ├── api/models.ts          # GET /api/models 封装
         ├── stores/chat.ts         # pinia：会话 / 消息 / 流式状态（会话由前端自管）
         ├── utils/markdown.ts      # marked + highlight.js 渲染（原始 HTML 转义）
         ├── components/            # SessionList / MessageItem / ReasoningPanel / ChatInput
-        └── views/                 # ChatView（已实现）；KnowledgeView / SettingsView（空壳）
+        └── views/                 # ChatView / KnowledgeView（已实现）；SettingsView（空壳）
 ```
 
 注意：`back/src/` 下是扁平模块（`main.py`、`config.py` 与各包平级；src 为源代码根、不是包，不要加 `__init__.py`），导入仍直接写 `from config import settings`、`from llm import get_model`；运行时数据与 `.env` 留在 `back/` 根（`config.BASE_DIR`）。新增顶层模块时避免与第三方包重名。
@@ -124,7 +125,9 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
    POST   /api/chat                             # 普通对话（回答 + 工具步骤）
    POST   /api/chat/stream                      # SSE 流式对话（事件协议见下）
    POST   /api/knowledge/upload                 # multipart 上传 PDF/TXT/MD；同名重传幂等
-   GET    /api/knowledge/list                   # 已入库文档（按源文件聚合）
+   GET    /api/knowledge/list                   # 已入库文档（按源文件聚合，含大小 / 上传时间 / 片段数）
+   POST   /api/knowledge/search                 # 检索测试（直接查向量库，返回片段 + 余弦相似度；不经 Agent）
+   DELETE /api/knowledge/document?name=...      # 删除单个文档（同时清理 uploads 中的源文件）
    DELETE /api/knowledge/clear                  # 清空向量库
    GET    /api/models                           # 可用模型列表
    POST   /api/models/switch                    # 切换默认模型（进程内，重启回 .env）
@@ -152,7 +155,7 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
 4. **其他实现约定**：
    - Agent 组装唯一入口 `agent.get_agent()`；事件生产唯一入口 `agent.stream_agent_events()`（定义于 agent/events.py，包级已再导出；api 层只做 SSE 包装，不碰 astream_events）。类式封装 `agent.DataAnalysisAgent`（run / stream）内部仅委托上述入口；`run` 语义：不传 chat_history 走会话记忆（同一 session_id 累积），传 chat_history 为无状态单次调用（临时 thread_id，不读写会话记忆）
    - 对话持久化：AsyncSqliteSaver（待补装）；当前 `/api/chat` 为无状态单轮（每请求新建 InMemorySaver），`session_id` 仅在 SSE `meta` 事件回传，跨请求记忆待会话阶段接入
-   - 每个知识库一个 Chroma collection（`kb_{id}`），chunk 元数据含 `source / page / doc_id / kb_id`
+   - 每个知识库一个 Chroma collection（`kb_{id}`；当前单库为 `knowledge`，cosine 距离度量），chunk 元数据含 `source / page / doc_id / kb_id`
    - 分析工具（tools.python_executor）在受限命名空间执行 pandas（禁 import / 双下划线属性），数据集阶段的文件访问需约束在 `data/datasets/`（边界与局限见附 2）
    - 图表由工具返回 ECharts option JSON（不生成图片），前端 `ChartCard` 渲染
 
@@ -204,6 +207,7 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
 
 - 百炼 Embedding：`OpenAIEmbeddings` 必须 `check_embedding_ctx_length=False` + `encoding_format="float"` + `chunk_size=10`，否则报 `contents is neither str nor list of str` 或 base64 不兼容（已封装在 `llm.get_embeddings()`）
 - `text-embedding-v3` 与 `text-embedding-v4` 向量空间不兼容：更换 `EMBEDDING_MODEL` 后必须 `RagService.clear()` 重建索引，否则检索结果错乱
+- Chroma collection 的距离度量创建后不可更改：`get_or_create_collection` 带不同 `configuration` 会**静默沿用**旧配置（已实测）；`knowledge` collection 固定 cosine（`collection_configuration={"hnsw": {"space": "cosine"}}`）——默认 l2 空间下 langchain 的 `1 - distance/√2` 相关性公式假设单位向量，对未归一化向量 + 平方距离会算出负数垃圾分，故检索相似度必须走 cosine（`相似度 = 1 - 余弦距离`）；更换度量 / embedding 模型须清空重建（`RagService.clear()` 或删 `chroma_db/`）
 - qwen3 系列：非流式调用与工具调用需 `extra_body={"enable_thinking": False}`（思考模式与 Function Calling / json mode 冲突）
 - 百炼已发布 2026-10-10 大批量模型下线公告（含 `deepseek-v3` 等第三方模型）：模型 ID 一律以百炼控制台为准，`AVAILABLE_MODELS` 可随时调整；第三方模型（glm-5 等）Function Calling 支持需实测
 - `pypdfium2` 只做文本抽取（无 OCR），扫描版 PDF 用 `pymupdf` 相关能力或后续加 OCR

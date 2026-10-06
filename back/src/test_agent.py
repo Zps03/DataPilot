@@ -25,9 +25,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-MULTI_STEP_QUESTION = (
-    "我们知识库中提到的产品退货率是多少？帮我计算如果退货率降低 2% 能节省多少成本"
-)
+MULTI_STEP_QUESTION = "我们知识库中提到的产品退货率是多少？帮我计算如果退货率降低 2% 能节省多少成本"
 
 
 def _assert(condition: bool, message: str) -> None:

@@ -40,7 +40,9 @@ async def _check_calculator() -> None:
 
     for expression in ["1/0", "__import__('os')", "2**100000", "1+"]:
         result = await calculator.ainvoke({"expression": expression})
-        _assert(result.startswith("计算失败"), f"calculator({expression!r}) 拒绝非法输入 → {result}")
+        _assert(
+            result.startswith("计算失败"), f"calculator({expression!r}) 拒绝非法输入 → {result}"
+        )
 
 
 async def _check_python_executor() -> None:

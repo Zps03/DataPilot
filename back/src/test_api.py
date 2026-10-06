@@ -1,8 +1,9 @@
-"""API 路由测试：健康检查 / Swagger / 模型列表与切换 / 知识库上传-列表-清空 / 对话（普通 + SSE）。
+"""API 路由测试：健康检查 / Swagger / 模型列表与切换 / 知识库上传-列表-检索-删除-清空 /
+对话（普通 + SSE）。
 
 运行：cd back && uv run python src/test_api.py
 前置：另开终端启动后端（uv run uvicorn main:app --app-dir src --port 8000），
-      并已配置 DASHSCOPE_API_KEY（上传入库与对话需联网）。脚本会清空并重建知识库，
+      并已配置 DASHSCOPE_API_KEY（上传入库、检索与对话需联网）。脚本会清空并重建知识库，
       结束时知识库为空。
 """
 
@@ -14,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from config import settings
 from test_rag import create_test_docs
 
 BASE_URL = "http://127.0.0.1:8000"
@@ -80,6 +82,8 @@ async def _main() -> None:
             "/api/chat/stream",
             "/api/knowledge/upload",
             "/api/knowledge/list",
+            "/api/knowledge/search",
+            "/api/knowledge/document",
             "/api/knowledge/clear",
             "/api/models",
             "/api/models/switch",
@@ -116,10 +120,40 @@ async def _main() -> None:
             _assert(uploaded["chunks"] > 0, f"{fixture.name} 入库片段数 > 0")
 
         before = (await client.get("/api/knowledge/list")).json()
-        _assert(len(before["documents"]) == 3, f"列表 3 个文档：{[d['name'] for d in before['documents']]}")
+        _assert(
+            len(before["documents"]) == 3,
+            f"列表 3 个文档：{[d['name'] for d in before['documents']]}",
+        )
+        first = next(d for d in before["documents"] if d["name"] == fixtures[0].name)
+        _assert(
+            first["size"] == fixtures[0].stat().st_size, f"列表含文件大小：{first['size']} 字节"
+        )
+        _assert(
+            isinstance(first["upload_time"], str) and "T" in first["upload_time"],
+            f"列表含上传时间：{first['upload_time']}",
+        )
         await _upload(client, fixtures[3])  # 重复上传同名文件
         after = (await client.get("/api/knowledge/list")).json()
-        _assert(before == after, "重复上传同名文件幂等（片段数不变）")
+        # 重传会刷新文件 mtime（upload_time 变化），幂等只看文档集合与片段数
+        _assert(
+            [(d["name"], d["chunks"]) for d in before["documents"]]
+            == [(d["name"], d["chunks"]) for d in after["documents"]],
+            "重复上传同名文件幂等（片段数不变）",
+        )
+
+        # 3.5) 检索测试（余弦相似度分数 + k 限制）
+        search = (await client.post("/api/knowledge/search", json={"query": "退货率是多少"})).json()
+        _assert(bool(search["results"]), f"检索返回 {len(search['results'])} 条结果")
+        top = search["results"][0]
+        _assert(top["doc"] == fixtures[3].name, f"最相关片段来自经营数据：{top['doc']}")
+        _assert(0.0 < top["score"] <= 1.0, f"余弦相似度在 (0, 1]：{top['score']}")
+        _assert(bool(top["snippet"]) and len(top["snippet"]) <= 200, "片段文本非空且截断 200 字符")
+        limited = (
+            await client.post("/api/knowledge/search", json={"query": "产品与服务", "k": 2})
+        ).json()
+        _assert(len(limited["results"]) == 2, f"k=2 返回 2 条（实际 {len(limited['results'])}）")
+        scores = [item["score"] for item in limited["results"]]
+        _assert(scores == sorted(scores, reverse=True), f"结果按相似度降序：{scores}")
 
         bad_type = await client.post(
             "/api/knowledge/upload", files={"file": ("bad.xyz", b"hello", "text/plain")}
@@ -154,12 +188,30 @@ async def _main() -> None:
         tokens = "".join(data["content"] for name, data in events if name == "token")
         _assert("4.5" in tokens, "流式正文包含检索到的退货率 4.5%")
         sources = [data["sources"] for name, data in events if name == "sources"]
-        _assert(bool(sources) and bool(sources[0]), f"sources 事件（{len(sources[0]) if sources else 0} 条）")
+        _assert(
+            bool(sources) and bool(sources[0]),
+            f"sources 事件（{len(sources[0]) if sources else 0} 条）",
+        )
         tool_names = [data["name"] for name, data in events if name == "tool_start"]
         _assert("search_knowledge" in tool_names, f"工具事件：{tool_names}")
         _assert(isinstance(events[-1][1].get("usage"), dict), f"done 携带 usage：{events[-1][1]}")
 
-        # 6) 收尾：清空知识库
+        # 6) 删除单个文档（同时清理 uploads 中的落盘文件）
+        deleted = await client.delete("/api/knowledge/document", params={"name": fixtures[3].name})
+        _assert(deleted.status_code == 200, "删除文档 HTTP 200")
+        _assert(
+            deleted.json()["deleted_chunks"] > 0, f"删除片段数：{deleted.json()['deleted_chunks']}"
+        )
+        remaining = (await client.get("/api/knowledge/list")).json()
+        _assert(len(remaining["documents"]) == 2, "删除后列表剩 2 个文档")
+        _assert(
+            not (settings.upload_dir / fixtures[3].name).exists(),
+            "uploads 目录中同名文件已清理",
+        )
+        missing = await client.delete("/api/knowledge/document", params={"name": "不存在.txt"})
+        _assert(missing.status_code == 404, f"删除不存在的文档返回 404：{missing.json()['detail']}")
+
+        # 7) 收尾：清空知识库
         await client.delete("/api/knowledge/clear")
         listing = (await client.get("/api/knowledge/list")).json()
         _assert(listing["documents"] == [] and listing["total_chunks"] == 0, "收尾清空知识库")

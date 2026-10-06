@@ -86,30 +86,39 @@ async def stream_agent_events(
                         if isinstance(value, int):
                             usage[key] = usage.get(key, 0) + value
             elif kind == "on_tool_start":
-                yield "tool_start", {
-                    "id": event["run_id"],
-                    "name": event["name"],
-                    "input": event["data"].get("input"),
-                }
+                yield (
+                    "tool_start",
+                    {
+                        "id": event["run_id"],
+                        "name": event["name"],
+                        "input": event["data"].get("input"),
+                    },
+                )
             elif kind == "on_tool_end":
                 output = event["data"].get("output")
-                yield "tool_end", {
-                    "id": event["run_id"],
-                    "name": event["name"],
-                    "status": "success",
-                    "summary": _summarize(output),
-                }
+                yield (
+                    "tool_end",
+                    {
+                        "id": event["run_id"],
+                        "name": event["name"],
+                        "status": "success",
+                        "summary": _summarize(output),
+                    },
+                )
                 if event["name"] == SEARCH_TOOL_NAME:
                     sources = _extract_sources(output)
                     if sources:
                         yield "sources", {"sources": sources}
             elif kind == "on_tool_error":
-                yield "tool_end", {
-                    "id": event["run_id"],
-                    "name": event["name"],
-                    "status": "error",
-                    "summary": str(event["data"].get("error"))[:200],
-                }
+                yield (
+                    "tool_end",
+                    {
+                        "id": event["run_id"],
+                        "name": event["name"],
+                        "status": "error",
+                        "summary": str(event["data"].get("error"))[:200],
+                    },
+                )
     except Exception:  # 已记日志，转为 error 事件收尾（BLE001 豁免）
         logger.exception("Agent 流式运行失败")
         yield "error", {"message": "运行出错，请查看后端日志"}

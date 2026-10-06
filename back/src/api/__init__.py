@@ -1,4 +1,5 @@
-"""路由层：对话（普通 / SSE 流式）、知识库（上传 / 列表 / 清空）、模型（列表 / 切换）、健康检查。
+"""路由层：对话（普通 / SSE 流式）、知识库（上传 / 列表 / 检索 / 删除 / 清空）、
+模型（列表 / 切换）、健康检查。
 
 约定（CLAUDE.md §6）：
 - 全部路由以 /api 为前缀；SSE 事件协议见 §6.2，事件由 agent.stream_agent_events 生产，
@@ -24,10 +25,14 @@ from models import (
     ChatRequest,
     ChatResponse,
     ClearResponse,
+    DeleteDocumentResponse,
     DocumentInfo,
     DocumentListResponse,
     HealthResponse,
     ModelsResponse,
+    SearchRequest,
+    SearchResponse,
+    SearchResultItem,
     SwitchModelRequest,
     SwitchModelResponse,
     ToolStep,
@@ -142,11 +147,44 @@ async def upload_document(
 
 @knowledge_router.get("/list", response_model=DocumentListResponse, summary="已入库文档列表")
 async def list_documents() -> DocumentListResponse:
-    """按源文件聚合列出已入库文档与片段数。"""
+    """按源文件聚合列出已入库文档、片段数与文件信息（大小 / 上传时间）。"""
     items = await asyncio.to_thread(get_rag_service().list_documents)
     return DocumentListResponse(
         documents=[DocumentInfo(**item) for item in items],
         total_chunks=sum(item["chunks"] for item in items),
+    )
+
+
+@knowledge_router.post(
+    "/search", response_model=SearchResponse, summary="检索测试（直接查询向量库）"
+)
+async def search_knowledge_base(request: SearchRequest) -> SearchResponse:
+    """对当前知识库做相似度检索（不经 Agent），返回片段与余弦相似度分数。"""
+    results = await asyncio.to_thread(
+        get_rag_service().search_with_scores, request.query, request.k
+    )
+    return SearchResponse(
+        query=request.query,
+        results=[SearchResultItem(**item) for item in results],
+    )
+
+
+@knowledge_router.delete("/document", response_model=DeleteDocumentResponse, summary="删除单个文档")
+async def delete_document(name: str) -> DeleteDocumentResponse:
+    """按文件名删除文档的全部片段；同时清理已上传文件（uploads 目录内，若有）。
+
+    文件名按 basename 匹配（与列表聚合口径一致）；文档不存在返回 404。
+    """
+    deleted = await asyncio.to_thread(get_rag_service().delete_document_by_name, name)
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail=f"文档不存在：{name}")
+    # 清理上传落盘文件（仅取 basename 防路径穿越；批量导入的 knowledge_docs 文件不在此目录）
+    upload_path = settings.upload_dir / Path(name).name
+    if upload_path.is_file():
+        await asyncio.to_thread(upload_path.unlink)
+    logger.info("删除文档：%s → %d 个片段", name, deleted)
+    return DeleteDocumentResponse(
+        name=name, deleted_chunks=deleted, message=f"已删除 {deleted} 个片段"
     )
 
 

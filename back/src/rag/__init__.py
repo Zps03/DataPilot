@@ -4,18 +4,21 @@
 - 解析：pypdfium2 逐页提取 PDF 文本（metadata.source + metadata.page）；TXT / Markdown
   直接读取（UTF-8 优先，回退 GBK）
 - 切分：RecursiveCharacterTextSplitter（中文分隔符优先）
-- 存储：langchain-chroma，持久化到 settings.chroma_dir
+- 存储：langchain-chroma，持久化到 settings.chroma_dir；collection 使用 cosine 距离
+  （文本 embedding 的标准度量；检索测试的「相似度」= 1 - 余弦距离）
 
 对外接口：
 - load_document / load_directory：单文件 / 目录批量解析为 Document 列表
 - split_documents：按 settings.chunk_size / chunk_overlap 切分
-- RagService：add_documents / add_directory / search / list_documents / delete_document / clear
+- RagService：add_documents / add_directory / search / search_with_scores /
+  list_documents / delete_document / delete_document_by_name / clear
 - get_rag_service：进程内单例（API 路由与 Agent 工具共用同一实例）
 
 均为同步实现（pypdfium2 与 Chroma 是同步库），API 层用 asyncio.to_thread 包装调用。
 """
 
 import logging
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -148,20 +151,23 @@ class RagService:
             Path(persist_directory) if persist_directory else settings.chroma_dir
         )
         self.chunk_size = chunk_size or settings.chunk_size
-        self.chunk_overlap = (
-            chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
-        )
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
         self._store: Chroma | None = None
 
     @property
     def store(self) -> Chroma:
-        """向量库连接（惰性建立：需要已配置 DASHSCOPE_API_KEY）。"""
+        """向量库连接（惰性建立：需要已配置 DASHSCOPE_API_KEY）。
+
+        collection 创建时固定 cosine 距离度量；注意：Chroma 的 collection 创建后距离度量
+        不可更改（get_or_create 会静默沿用旧配置），旧的 l2 库需清空重建（删除 chroma_db/）。
+        """
         if self._store is None:
             self.persist_directory.mkdir(parents=True, exist_ok=True)
             self._store = Chroma(
                 collection_name=self.collection_name,
                 embedding_function=get_embeddings(),
                 persist_directory=str(self.persist_directory),
+                collection_configuration={"hnsw": {"space": "cosine"}},
             )
         return self._store
 
@@ -196,16 +202,56 @@ class RagService:
         """相似度检索，返回最相关的 k 个片段（默认 settings.top_k）。"""
         return self.store.similarity_search(query, k=k or settings.top_k)
 
+    def search_with_scores(self, query: str, k: int | None = None) -> list[dict[str, Any]]:
+        """相似度检索（带分数），返回 [{doc, page, snippet, score}]，按相关度降序。
+
+        score 为余弦相似度（1 - 余弦距离，越大越相关）；snippet 与 Agent 工具的来源卡片
+        同口径（截断 200 字符并折叠空白）。供检索测试接口使用。
+        """
+        results = self.store.similarity_search_with_relevance_scores(query, k=k or settings.top_k)
+        items: list[dict[str, Any]] = []
+        for document, score in results:
+            metadata = document.metadata
+            items.append(
+                {
+                    "doc": Path(str(metadata.get("source", ""))).name or "未知来源",
+                    "page": metadata.get("page"),
+                    "snippet": " ".join(document.page_content[:200].split()),
+                    "score": round(float(score), 4),
+                }
+            )
+        return items
+
     def list_documents(self) -> list[dict[str, Any]]:
-        """按源文件聚合已入库文档：[{name, chunks}]（按文件名排序；空库返回 []）。"""
+        """按源文件聚合已入库文档：[{name, chunks, size, upload_time}]（按文件名排序；空库 []）。
+
+        size / upload_time 取自源文件磁盘信息（upload_time 为文件写入时间，近似上传时间，
+        ISO 8601）；源文件已被移动或删除时两者为 None。
+        """
         metadatas = self.store.get(include=["metadatas"]).get("metadatas") or []
         counts: dict[str, int] = {}
+        source_of: dict[str, str] = {}
         for meta in metadatas:
             if not meta:
                 continue
-            name = Path(str(meta.get("source", ""))).name or "未知来源"
+            source = str(meta.get("source", ""))
+            name = Path(source).name or "未知来源"
             counts[name] = counts.get(name, 0) + 1
-        return [{"name": name, "chunks": count} for name, count in sorted(counts.items())]
+            source_of.setdefault(name, source)
+        items: list[dict[str, Any]] = []
+        for name, count in sorted(counts.items()):
+            size: int | None = None
+            upload_time: str | None = None
+            try:
+                stat = Path(source_of[name]).stat()
+            except OSError:
+                pass  # 源文件已被移动 / 删除：仅展示片段数
+            else:
+                stamp = datetime.fromtimestamp(stat.st_mtime, tz=UTC).astimezone()
+                size = stat.st_size
+                upload_time = stamp.isoformat(timespec="seconds")
+            items.append({"name": name, "chunks": count, "size": size, "upload_time": upload_time})
+        return items
 
     def delete_document(self, source: str | Path) -> int:
         """删除某源文件（source 路径精确匹配）的全部片段，返回删除数量。"""
@@ -215,6 +261,21 @@ class RagService:
         if ids:
             self.store.delete(ids=ids)
         logger.info("已删除文档片段：source=%s，共 %d 个", source_key, len(ids))
+        return len(ids)
+
+    def delete_document_by_name(self, name: str) -> int:
+        """按文件名（basename 匹配，与列表聚合口径一致）删除其全部片段，返回删除数量。"""
+        data = self.store.get(include=["metadatas"])
+        ids = [
+            chunk_id
+            for chunk_id, meta in zip(
+                data.get("ids") or [], data.get("metadatas") or [], strict=True
+            )
+            if meta and Path(str(meta.get("source", ""))).name == name
+        ]
+        if ids:
+            self.store.delete(ids=ids)
+        logger.info("按文件名删除：name=%s，共 %d 个片段", name, len(ids))
         return len(ids)
 
     def clear(self) -> None:

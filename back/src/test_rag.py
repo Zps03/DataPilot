@@ -158,9 +158,7 @@ def _offline_check(pdf_path: Path) -> None:
         page = f" 第 {item.metadata['page']} 页" if "page" in item.metadata else ""
         print(f"     - {name}{page}（{len(item.page_content)} 字符）")
 
-    pdf_pages = [
-        d for d in documents if Path(d.metadata["source"]).name == pdf_path.name
-    ]
+    pdf_pages = [d for d in documents if Path(d.metadata["source"]).name == pdf_path.name]
     if len(pdf_pages) != len(TECH_PDF_PAGES):
         raise SystemExit(
             f"[FAIL] PDF 应按页生成 {len(TECH_PDF_PAGES)} 个 Document，实际 {len(pdf_pages)} 个"

@@ -12,10 +12,14 @@ __all__: list[str] = [
     "ChatRequest",
     "ChatResponse",
     "ClearResponse",
+    "DeleteDocumentResponse",
     "DocumentInfo",
     "DocumentListResponse",
     "HealthResponse",
     "ModelsResponse",
+    "SearchRequest",
+    "SearchResponse",
+    "SearchResultItem",
     "SwitchModelRequest",
     "SwitchModelResponse",
     "ToolStep",
@@ -62,6 +66,10 @@ class DocumentInfo(BaseModel):
 
     name: str = Field(description="文件名")
     chunks: int = Field(description="片段数")
+    size: int | None = Field(default=None, description="文件大小（字节）；源文件缺失时为 null")
+    upload_time: str | None = Field(
+        default=None, description="上传时间（ISO 8601，取文件写入时间）；源文件缺失时为 null"
+    )
 
 
 class DocumentListResponse(BaseModel):
@@ -69,6 +77,37 @@ class DocumentListResponse(BaseModel):
 
     documents: list[DocumentInfo]
     total_chunks: int
+
+
+class SearchRequest(BaseModel):
+    """检索测试请求。"""
+
+    query: str = Field(min_length=1, max_length=2000, description="查询文本")
+    k: int | None = Field(default=None, ge=1, le=50, description="返回片段数；为空用服务端 TOP_K")
+
+
+class SearchResultItem(BaseModel):
+    """检索结果片段。"""
+
+    doc: str = Field(description="文件名")
+    page: int | None = Field(default=None, description="页码（PDF 有，其余为 null）")
+    snippet: str = Field(description="片段文本（截断 200 字符并折叠空白）")
+    score: float = Field(description="余弦相似度（1 - 余弦距离，越大越相关）")
+
+
+class SearchResponse(BaseModel):
+    """检索测试响应（按相关度降序）。"""
+
+    query: str
+    results: list[SearchResultItem]
+
+
+class DeleteDocumentResponse(BaseModel):
+    """删除单个文档响应。"""
+
+    name: str
+    deleted_chunks: int = Field(description="删除的片段数")
+    message: str
 
 
 class ModelsResponse(BaseModel):

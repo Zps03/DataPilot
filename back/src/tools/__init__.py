@@ -48,6 +48,7 @@ SEARCH_TOOL_NAME = "search_knowledge"
 
 # ------------------------------------------------------------------ 知识库检索
 
+
 def _to_source(document: Document, max_len: int = 200) -> dict[str, str | int | None]:
     """检索片段 → sources 条目（snippet 为折叠空白后的摘要，供前端来源卡片展示）。"""
     snippet = " ".join(document.page_content[:max_len].split())

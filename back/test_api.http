@@ -5,3 +5,25 @@ GET http://127.0.0.1:8000/api/health
 Accept: application/json
 
 ###
+
+# 知识库：已入库文档列表（含大小 / 上传时间 / 片段数）
+GET http://127.0.0.1:8000/api/knowledge/list
+Accept: application/json
+
+###
+
+# 知识库：检索测试（返回片段 + 余弦相似度分数）
+POST http://127.0.0.1:8000/api/knowledge/search
+Content-Type: application/json
+
+{
+  "query": "退货率是多少",
+  "k": 5
+}
+
+###
+
+# 知识库：删除单个文档（按文件名，同时清理 uploads 中的文件）
+DELETE http://127.0.0.1:8000/api/knowledge/document?name=04-经营数据.md
+
+###

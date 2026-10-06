@@ -83,9 +83,7 @@ def _message_text(message: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            part.get("text", "") for part in content if isinstance(part, dict)
-        )
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
     return str(content)
 
 
@@ -102,9 +100,7 @@ def _extract_steps(messages: Sequence[Any]) -> list[dict[str, Any]]:
                 output = observations.get(call["id"], "")
                 if len(output) > _STEP_OUTPUT_MAX_LEN:
                     output = f"{output[:_STEP_OUTPUT_MAX_LEN]}…"
-                steps.append(
-                    {"tool": call["name"], "input": call["args"], "output": output}
-                )
+                steps.append({"tool": call["name"], "input": call["args"], "output": output})
     return steps
 
 
