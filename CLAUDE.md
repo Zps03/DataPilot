@@ -158,7 +158,7 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
    - Agent 组装唯一入口 `agent.get_agent()`；事件生产唯一入口 `agent.stream_agent_events()`（定义于 agent/events.py，包级已再导出；api 层只做 SSE 包装，不碰 astream_events）。类式封装 `agent.DataAnalysisAgent`（run / stream）内部仅委托上述入口；`run` 语义：不传 chat_history 走会话记忆（同一 session_id 累积），传 chat_history 为无状态单次调用（临时 thread_id，不读写会话记忆）
    - 对话持久化：AsyncSqliteSaver（待补装）；当前 `/api/chat` 为无状态单轮（每请求新建 InMemorySaver），`session_id` 仅在 SSE `meta` 事件回传，跨请求记忆待会话阶段接入
    - 每个知识库一个 Chroma collection（`kb_{id}`；当前单库为 `knowledge`，cosine 距离度量），chunk 元数据含 `source / page / doc_id / kb_id`
-   - 分析工具（tools.python_executor）在受限命名空间执行 pandas（禁 import / 双下划线属性），数据集阶段的文件访问需约束在 `data/datasets/`（边界与局限见附 2）
+   - 分析工具（tools.python_executor）在受限命名空间执行 pandas：禁 import / 双下划线名称与属性，并按名字拒绝文件读写与反序列化入口（`_FORBIDDEN_ATTRS`：`read_*` / `to_*` / `load` / `save` / `format` 等）；15 秒执行上限 + 独立守护线程执行器（边界与局限见附 2）
    - 图表由工具返回 ECharts option JSON（不生成图片），前端 `ChartCard` 渲染
 
 ## 7. 环境变量说明
@@ -174,6 +174,8 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
 | `EMBEDDING_MODEL` | `text-embedding-v3` | 向量模型（v3/v4 向量空间不兼容，切换须重建索引） |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `700` / `100` | 文本切分参数 |
 | `TOP_K` | `5` | 检索片段数 |
+| `MAX_UPLOAD_MB` | `20` | 上传单文件大小上限（服务端强制，超限 413） |
+| `AGENT_TIMEOUT_SECONDS` | `180` | 单轮对话总时长上限（超时普通对话 504 / 流式 error 事件） |
 | `CHROMA_DIR` | `chroma_db/`（基于 back/ 解析） | 向量库持久化目录 |
 | `KNOWLEDGE_DOCS_DIR` | `knowledge_docs/`（基于 back/ 解析） | 批量导入的默认文档目录 |
 | `UPLOAD_DIR` / `DATASETS_DIR` / `SQLITE_PATH` | `data/...` | 运行时数据路径 |
@@ -224,6 +226,10 @@ PyCharm 提示：解释器指向 `back/.venv`；后端运行配置 module 填 `m
 - SSE 裸报文格式：`EventSourceResponse` 输出 `event:` / `data:` 行 + 空行分隔，`data` 需自行 `json.dumps(ensure_ascii=False)`；默认每 15s 发 `: ping` 注释行（前端解析需忽略 `:` 开头行）。Windows Git Bash 向系统 curl 传中文 JSON 参数会乱码（报 FastAPI「error parsing the body」）：改用 `printf + --data-binary @-`，或直接用 httpx（test_api.py）验证
 - `@microsoft/fetch-event-source`：`onerror` 回调必须 `throw`（返回非 undefined 会被当作重试间隔，POST 流式请求重放会导致消息重复）；`openWhenHidden: true` 防止标签页隐藏时 abort；自定义 `onopen` 会替换默认的 content-type 检查；signal abort 后 promise 是 resolve 而非 reject，调用方需以 `signal.aborted` 区分「手动停止」与异常
 - Vue 响应式：`push` 进 reactive 数组后的对象必须重新从数组读取（拿代理）再修改，否则流式增量更新不触发重渲染
-- `python_executor` 是受限命名空间而非安全沙箱：白名单 builtins + AST 拒绝 import / 双下划线名称与属性；numpy/pandas 的 C 扩展会在调用帧内懒加载 import（帧内无 `__import__` 会报 `KeyError: '__import__'`），故注入 `_guarded_import` 仅放行 numpy/pandas 子模块；无超时控制（死循环会挂住工作线程），pandas 注入后其内部 IO（read_csv 等）不受语言层限制，数据集阶段需在工具层约束路径
+- `python_executor` 是受限命名空间而非安全沙箱：白名单 builtins + AST 拒绝 import / 双下划线名称与属性；numpy/pandas 的 C 扩展会在调用帧内懒加载 import（帧内无 `__import__` 会报 `KeyError: '__import__'`），故注入 `_guarded_import` 仅放行 numpy/pandas 子模块。**实测教训**：单靠 AST 拦不住 pandas 自带的 IO——`pd.read_csv('.env')` 可读到 `back/.env` 里的 API Key、`np.save` 可向任意路径写文件、`pd.read_pickle`/`np.load(allow_pickle=True)` 是反序列化入口，而 `'{0.__class__}'.format(pd)` 会绕过双下划线属性检查（属性名藏在字符串里）。故新增 `_FORBIDDEN_ATTRS` 按属性名封堵并移除 `format`（f-string 走 FORMAT_VALUE 字节码，不受影响）。这仍是黑名单式封堵，不是能力隔离；pandas 注入后其内部 IO 不受语言层限制，数据集阶段需在工具层约束路径
+- `python_executor` 超时是 **best-effort**：15 秒上限用 `asyncio.wait_for` 实现，纯 Python 死循环（求值循环周期性释放 GIL）能准时中止；但**单次持有 GIL 的 C 级运算**（如 `9**20000000` 巨型大整数乘幂，实测 22 秒）会连事件循环一起冻住，定时器回调无法执行、超时根本不生效，整个服务卡住该运算的时长。彻底隔离需改为子进程（可强制 kill + 资源限额）
+- `python_executor` 用自建守护线程执行器（`_DaemonExecutor`）而非 `asyncio.to_thread`/`ThreadPoolExecutor`：后者的工作线程是**非守护线程**且 `concurrent.futures` 注册了 atexit join——一旦超时后的计算仍在跑（线程无法强杀），**进程将永远无法退出**（Ctrl+C / uvicorn 关闭时卡死，实测 `exit=124`）。守护线程随解释器退出被回收；投递结果用 `loop.call_soon_threadsafe` 并吞掉循环已关闭时的 `RuntimeError`。另：专用执行器与 asyncio 默认池隔离（默认池同时承载 Chroma / 文档解析 / 文件写入）
+- 前端 Markdown 渲染：marked 自带的 `cleanUrl` **只做 `encodeURI`、不校验协议**（v18 实测），故 `[x](javascript:alert(1))` 会渲染成可点击的 `javascript:` 链接，在 `v-html` 场景下是 XSS（大小写混写、前缀空格均可绕过）。`utils/markdown.ts` 必须自行重写 `link`/`image` 渲染器做协议白名单（http/https/mailto/tel + 相对路径），不合法时降级为纯文本；原始 HTML 的转义由 `html` 渲染器负责
+- 上传大小限制必须服务端强制：前端 `KnowledgeView` 的 20MB 校验只是提示，用 curl/httpx 可零成本绕过；`api._read_upload_limited` 分块读取并累加计数，超限 413（`MAX_UPLOAD_MB`）
 - 在 `back/.venv` 内检索已装库源码时，Grep 工具会因 `.gitignore` 忽略 `.venv/` 而搜不到：改用 Bash `grep` 或指定具体文件路径（指定文件不受忽略规则影响）
 - Windows 控制台默认 GBK 编码，中文输出乱码：入口脚本已对 stdout/stderr 强制 UTF-8（`sys.stdout.reconfigure`）；后续新增打印中文的脚本照做，终端仍乱码则用 `chcp 65001` 或 Windows Terminal

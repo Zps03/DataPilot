@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     top_k: int = 5
     knowledge_docs_dir: Path = BASE_DIR / "knowledge_docs"  # 批量导入的默认目录
 
+    # ---- 运行时限制 ----
+    max_upload_mb: int = 20  # 单个上传文件大小上限（服务端强制，前端同值仅作提示）
+    agent_timeout_seconds: float = 180.0  # 单轮对话总时长上限（含工具调用与多步推理）
+
     # ---- 运行时路径（相对路径基于 back/ 解析） ----
     data_dir: Path = BASE_DIR / "data"
     chroma_dir: Path = BASE_DIR / "chroma_db"
@@ -67,6 +71,11 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def max_upload_bytes(self) -> int:
+        """上传大小上限（字节）。"""
+        return self.max_upload_mb * 1024 * 1024
 
     def ensure_dirs(self) -> None:
         """创建运行时目录（幂等，lifespan 启动时调用）。"""

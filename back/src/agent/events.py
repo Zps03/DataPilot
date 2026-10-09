@@ -7,6 +7,7 @@ error / done；langgraph 单轮事件可达上千条，这里只保留契约内�
 禁止依赖默认值，避免升级后事件形态悄悄变化。
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -14,6 +15,7 @@ from typing import Any
 
 from langgraph.graph.state import CompiledStateGraph
 
+from config import settings
 from tools import SEARCH_TOOL_NAME
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,10 @@ async def stream_agent_events(
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """运行 Agent 并逐条产出契约事件。
 
+    整轮对话受 settings.agent_timeout_seconds 约束：超时会取消 Agent 任务并补发 error
+    事件收尾，避免 LLM 挂起 / 工具卡死时 SSE 永久停在中间状态（前端 streaming 标志
+    卡在 true，用户无法继续发送）。
+
     Args:
         agent: get_agent() 构建的 Agent。
         message: 本轮用户输入。
@@ -64,61 +70,69 @@ async def stream_agent_events(
     usage: dict[str, int] = {}
     config = {"configurable": {"thread_id": session_id}}
     try:
-        async for event in agent.astream_events(
-            {"messages": [{"role": "user", "content": message}]},
-            config=config,
-            version="v2",
-        ):
-            kind = event["event"]
-            if kind == "on_chat_model_stream":
-                chunk = event["data"].get("chunk")
-                if chunk is None:
-                    continue
-                reasoning = chunk.additional_kwargs.get("reasoning_content")
-                if reasoning:
-                    yield "reasoning", {"content": reasoning}
-                if isinstance(chunk.content, str) and chunk.content:
-                    yield "token", {"content": chunk.content}
-            elif kind == "on_chat_model_end":
-                meta = getattr(event["data"].get("output"), "usage_metadata", None)
-                if meta:
-                    for key, value in meta.items():
-                        if isinstance(value, int):
-                            usage[key] = usage.get(key, 0) + value
-            elif kind == "on_tool_start":
-                yield (
-                    "tool_start",
-                    {
-                        "id": event["run_id"],
-                        "name": event["name"],
-                        "input": event["data"].get("input"),
-                    },
-                )
-            elif kind == "on_tool_end":
-                output = event["data"].get("output")
-                yield (
-                    "tool_end",
-                    {
-                        "id": event["run_id"],
-                        "name": event["name"],
-                        "status": "success",
-                        "summary": _summarize(output),
-                    },
-                )
-                if event["name"] == SEARCH_TOOL_NAME:
-                    sources = _extract_sources(output)
-                    if sources:
-                        yield "sources", {"sources": sources}
-            elif kind == "on_tool_error":
-                yield (
-                    "tool_end",
-                    {
-                        "id": event["run_id"],
-                        "name": event["name"],
-                        "status": "error",
-                        "summary": str(event["data"].get("error"))[:200],
-                    },
-                )
+        # 注意：CancelledError 属 BaseException，客户端断连时不落入下面两个 except，
+        # 会正常向上传播并由 SSE 框架结束生成器
+        async with asyncio.timeout(settings.agent_timeout_seconds):
+            async for event in agent.astream_events(
+                {"messages": [{"role": "user", "content": message}]},
+                config=config,
+                version="v2",
+            ):
+                kind = event["event"]
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"].get("chunk")
+                    if chunk is None:
+                        continue
+                    reasoning = chunk.additional_kwargs.get("reasoning_content")
+                    if reasoning:
+                        yield "reasoning", {"content": reasoning}
+                    if isinstance(chunk.content, str) and chunk.content:
+                        yield "token", {"content": chunk.content}
+                elif kind == "on_chat_model_end":
+                    meta = getattr(event["data"].get("output"), "usage_metadata", None)
+                    if meta:
+                        for key, value in meta.items():
+                            if isinstance(value, int):
+                                usage[key] = usage.get(key, 0) + value
+                elif kind == "on_tool_start":
+                    yield (
+                        "tool_start",
+                        {
+                            "id": event["run_id"],
+                            "name": event["name"],
+                            "input": event["data"].get("input"),
+                        },
+                    )
+                elif kind == "on_tool_end":
+                    output = event["data"].get("output")
+                    yield (
+                        "tool_end",
+                        {
+                            "id": event["run_id"],
+                            "name": event["name"],
+                            "status": "success",
+                            "summary": _summarize(output),
+                        },
+                    )
+                    if event["name"] == SEARCH_TOOL_NAME:
+                        sources = _extract_sources(output)
+                        if sources:
+                            yield "sources", {"sources": sources}
+                elif kind == "on_tool_error":
+                    yield (
+                        "tool_end",
+                        {
+                            "id": event["run_id"],
+                            "name": event["name"],
+                            "status": "error",
+                            "summary": str(event["data"].get("error"))[:200],
+                        },
+                    )
+    except TimeoutError:
+        logger.warning("Agent 流式运行超时：%.0f 秒", settings.agent_timeout_seconds)
+        seconds = f"{settings.agent_timeout_seconds:.0f}"
+        yield "error", {"message": f"运行超时（超过 {seconds} 秒），已中止本轮回答"}
+        return
     except Exception:  # 已记日志，转为 error 事件收尾（BLE001 豁免）
         logger.exception("Agent 流式运行失败")
         yield "error", {"message": "运行出错，请查看后端日志"}

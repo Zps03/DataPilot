@@ -65,10 +65,21 @@ chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 @chat_router.post("", response_model=ChatResponse, summary="普通对话（一次性返回最终回答）")
 async def chat(request: ChatRequest) -> ChatResponse:
-    """执行一轮对话，返回最终回答与工具步骤；流式版本见 /api/chat/stream。"""
+    """执行一轮对话，返回最终回答与工具步骤；流式版本见 /api/chat/stream。
+
+    整轮对话受 settings.agent_timeout_seconds 约束，超时返回 504（流式版为 error 事件）。
+    """
     model_name = _resolve_model_name(request.model_name)
     agent = DataAnalysisAgent(model_name, session_id=request.session_id or "default")
-    result = await agent.run(request.message)
+    try:
+        async with asyncio.timeout(settings.agent_timeout_seconds):
+            result = await agent.run(request.message)
+    except TimeoutError:
+        logger.warning("对话超时：%.0f 秒", settings.agent_timeout_seconds)
+        seconds = f"{settings.agent_timeout_seconds:.0f}"
+        raise HTTPException(
+            status_code=504, detail=f"对话超时（超过 {seconds} 秒），请重试"
+        ) from None
     return ChatResponse(
         model_name=model_name,
         output=result["output"],
@@ -103,6 +114,27 @@ knowledge_router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 _SUPPORTED_HINT = "、".join(sorted(SUPPORTED_SUFFIXES))
 
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+async def _read_upload_limited(file: UploadFile) -> bytes:
+    """分块读取上传内容，超过 settings.max_upload_mb 立即中断。
+
+    前端 KnowledgeView 的 20MB 校验只是提示（可绕过），服务端必须独立强制。
+
+    Raises:
+        HTTPException: 413 文件超过上限；400 文件为空。
+    """
+    limit = settings.max_upload_bytes
+    buffer = bytearray()
+    while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
+        buffer.extend(chunk)
+        if len(buffer) > limit:
+            raise HTTPException(status_code=413, detail=f"文件超过 {settings.max_upload_mb}MB 上限")
+    if not buffer:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    return bytes(buffer)
+
 
 @knowledge_router.post("/upload", response_model=UploadResponse, summary="上传文档并入库")
 async def upload_document(
@@ -110,7 +142,7 @@ async def upload_document(
 ) -> UploadResponse:
     """保存上传文件（settings.upload_dir）→ 解析切分 → 嵌入入库，返回片段数。
 
-    同名文件重复上传为幂等操作（先删同源旧片段）；类型与空文件前置校验。
+    同名文件重复上传为幂等操作（先删同源旧片段）；类型、大小与空文件前置校验。
     """
     filename = Path(file.filename or "").name
     if not filename:
@@ -120,9 +152,7 @@ async def upload_document(
         detail = f"不支持的文件类型：{suffix or '无扩展名'}（支持 {_SUPPORTED_HINT}）"
         raise HTTPException(status_code=400, detail=detail)
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="上传文件为空")
+    content = await _read_upload_limited(file)
 
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     target = settings.upload_dir / filename

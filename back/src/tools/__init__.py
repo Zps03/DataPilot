@@ -9,8 +9,18 @@
 - 检索与代码执行为异步工具（同步 IO 用 asyncio.to_thread 包装）；纯计算的 calculator /
   get_current_time 保持同步（LangGraph 在异步图里经工作线程调用同步工具）。
 
-安全边界：python_executor 只是受限命名空间（builtins 白名单 + 禁 import / 双下划线名称
-与属性），不是安全沙箱、无超时控制，仅用于执行模型生成的分析代码，不得作为安全机制依赖。
+安全边界：python_executor 是「受限命名空间 + 名称级封堵」，**不是安全沙箱**：
+- builtins 白名单（无 open / eval / exec / compile / getattr / format，`__import__` 换成
+  只放行 numpy / pandas 的 _guarded_import）
+- AST 层拒绝 import、双下划线名称与属性（阻断 __class__ / __subclasses__ 一类逃逸）
+- 按名字拒绝 pandas / numpy 的文件读写与反序列化入口（见 _FORBIDDEN_ATTRS）
+- 15 秒执行上限 + 独立守护线程执行器（不占用 asyncio 默认池，超时不阻塞进程退出）
+
+封堵是黑名单式的，理论上仍存在未覆盖的 IO 路径，仅用于执行模型生成的分析代码，
+不得作为安全机制依赖。**超时也是 best-effort**：纯 Python 死循环（求值循环会周期性
+释放 GIL）能准时中止，但单次持有 GIL 的 C 级运算（如 `9**20000000` 这类巨型大整数
+乘幂）会连事件循环一起冻住，定时器回调无法执行，超时不会生效——此时整个服务会卡住
+该运算的时长。需要彻底隔离应改为子进程执行（可强制 kill + 资源限额）。
 """
 
 import ast
@@ -20,6 +30,8 @@ import datetime
 import io
 import math
 import operator
+import queue
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -162,7 +174,9 @@ def calculator(expression: str) -> str:
 
 # --------------------------------------------------------------- Python 代码执行
 
-# builtins 白名单：不要加入 open / eval / exec / compile / getattr 等
+# builtins 白名单：不要加入 open / eval / exec / compile / getattr / format 等
+# （format 不经 AST 检查即可读出任意对象双下划线属性的文本表示，见 _FORBIDDEN_ATTRS；
+#   f-string 的数值格式化走 FORMAT_VALUE 字节码，不受此白名单影响，仍可用）
 # （__import__ 不在列表中，由 _run_exec 注入受限版本 _guarded_import）
 _SAFE_BUILTINS: dict[str, Any] = {
     "abs": abs,
@@ -174,7 +188,6 @@ _SAFE_BUILTINS: dict[str, Any] = {
     "enumerate": enumerate,
     "filter": filter,
     "float": float,
-    "format": format,
     "int": int,
     "isinstance": isinstance,
     "len": len,
@@ -198,10 +211,161 @@ _SAFE_BUILTINS: dict[str, Any] = {
 
 _MAX_EXEC_RESULT_LEN = 3000
 
+# 执行上限（best-effort，见 python_executor）与专用执行器
+_EXEC_TIMEOUT_SECONDS = 15.0
+_EXEC_MAX_WORKERS = 2
+
+
+def _deliver(
+    loop: asyncio.AbstractEventLoop,
+    future: asyncio.Future[str],
+    value: str | BaseException,
+    *,
+    is_exception: bool = False,
+) -> None:
+    """把工作线程的结果投递回事件循环；循环已关闭（进程退出中）时静默丢弃。"""
+    setter = _set_exception_if_pending if is_exception else _set_result_if_pending
+    try:
+        loop.call_soon_threadsafe(setter, future, value)
+    except RuntimeError:
+        pass  # 事件循环已关闭，结果无处投递
+
+
+def _set_result_if_pending(future: asyncio.Future[str], value: str) -> None:
+    if not future.done():
+        future.set_result(value)
+
+
+def _set_exception_if_pending(future: asyncio.Future[str], exc: BaseException) -> None:
+    if not future.done():
+        future.set_exception(exc)
+
+
+class _DaemonExecutor:
+    """固定守护线程 + 无界队列的执行器（替代 ThreadPoolExecutor）。
+
+    为什么不用 ThreadPoolExecutor：它的工作线程是**非守护线程**，且 concurrent.futures
+    注册了 atexit join——一旦有计算超时后仍在跑（线程无法强杀，见 python_executor），
+    进程将**永远无法退出**（Ctrl+C / uvicorn 关闭时卡死，已实测复现）。
+    守护线程随解释器退出被强制回收，代价是超时任务不会跑完，换取进程可正常关闭。
+    """
+
+    def __init__(self, max_workers: int, thread_name_prefix: str) -> None:
+        self._max_workers = max_workers
+        self._prefix = thread_name_prefix
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+
+    def _worker(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                job()
+            finally:
+                self._queue.task_done()
+
+    def _ensure_workers(self) -> None:
+        with self._lock:
+            alive = sum(1 for thread in self._threads if thread.is_alive())
+            for index in range(alive, self._max_workers):
+                thread = threading.Thread(
+                    target=self._worker, name=f"{self._prefix}-{index}", daemon=True
+                )
+                thread.start()
+                self._threads.append(thread)
+
+    def run(self, func: Callable[..., str], *args: Any) -> asyncio.Future[str]:
+        """在守护线程中执行 func(*args)，返回可 await 的 Future（不阻塞事件循环）。"""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._ensure_workers()
+
+        def job() -> None:
+            if future.cancelled():  # 已超时放弃等待，无需再算
+                return
+            try:
+                result = func(*args)
+            except BaseException as exc:  # noqa: BLE001 — 原样转交给等待方判定
+                _deliver(loop, future, exc, is_exception=True)
+            else:
+                _deliver(loop, future, result)
+
+        self._queue.put(job)
+        return future
+
+
+# 独立于 asyncio 默认池（Chroma / 文档解析 / 文件写入共用）：卡死时只影响
+# python_executor 自身，不会拖垮其他接口
+_EXEC_POOL = _DaemonExecutor(_EXEC_MAX_WORKERS, "py-exec")
+
 
 class RestrictedCodeError(RuntimeError):
-    """代码包含受限语法（import / 双下划线名称或属性）。"""
+    """代码包含受限语法（import / 双下划线名称或属性 / 文件与反序列化入口）。"""
 
+
+# 按属性名封堵的 IO 与反序列化入口（不限 base 对象）。
+# 受限命名空间收不回 pandas / numpy 自带的文件与网络能力，而它们的入口属性名都不含
+# 双下划线、可被 AST 检查直接看到，故按名字拒绝。pandas / numpy 的磁盘 IO 与
+# pickle 反序列化（pd.read_pickle / np.load(allow_pickle=True)）可读取宿主任意文件
+# （含 back/.env 中的 API Key）乃至执行任意代码，必须堵死。
+_FORBIDDEN_ATTRS = frozenset(
+    {
+        # pandas 读
+        "read_csv",
+        "read_table",
+        "read_fwf",
+        "read_excel",
+        "read_json",
+        "read_html",
+        "read_xml",
+        "read_parquet",
+        "read_feather",
+        "read_orc",
+        "read_hdf",
+        "read_sas",
+        "read_spss",
+        "read_stata",
+        "read_clipboard",
+        "read_gbq",
+        "read_sql",
+        "read_sql_query",
+        "read_sql_table",
+        "read_pickle",
+        # pandas 写
+        "to_csv",
+        "to_excel",
+        "to_json",
+        "to_html",
+        "to_xml",
+        "to_latex",
+        "to_markdown",
+        "to_parquet",
+        "to_feather",
+        "to_orc",
+        "to_hdf",
+        "to_stata",
+        "to_clipboard",
+        "to_gbq",
+        "to_sql",
+        "to_pickle",
+        # numpy IO / 反序列化
+        "load",
+        "loadtxt",
+        "genfromtxt",
+        "fromfile",
+        "memmap",
+        "open_memmap",
+        "save",
+        "savez",
+        "savez_compressed",
+        "savetxt",
+        "tofile",
+        # 反射入口：str.format 会渲染出任意对象双下划线属性的文本表示，
+        # 绕过上面的双下划线属性检查（f-string 不受影响）
+        "format",
+    }
+)
 
 # 仅放行 numpy / pandas 及其依赖的内部懒加载；用户代码触碰不到该函数（见 _guarded_import）
 _IMPORT_ALLOWED_ROOTS = frozenset({"numpy", "pandas"})
@@ -222,14 +386,23 @@ def _guarded_import(name: str, *args: Any, **kwargs: Any) -> Any:
 
 
 def _validate_exec_code(tree: ast.AST) -> None:
-    """拒绝 import 与双下划线名称/属性（阻断 __class__、__subclasses__ 一类逃逸写法）。"""
+    """拒绝 import、双下划线名称/属性，以及 IO / 反序列化 / 反射入口（_FORBIDDEN_ATTRS）。
+
+    属性检查不限 base 对象：pandas 与 numpy 的文件、网络与反序列化入口（read_* / to_* /
+    load / save 等）均按名字封堵；用户代码也触碰不到真正的文件对象。
+    """
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             raise RestrictedCodeError("不允许 import；pandas（pd）与 numpy（np）已预置")
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise RestrictedCodeError(f"不允许使用名称：{node.id}")
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            raise RestrictedCodeError(f"不允许访问属性：{node.attr}")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                raise RestrictedCodeError(f"不允许访问属性：{node.attr}")
+            if node.attr in _FORBIDDEN_ATTRS:
+                raise RestrictedCodeError(
+                    f"不允许使用：{node.attr}（禁止文件读写、网络请求、反序列化与反射）"
+                )
 
 
 def _make_print(buffer: io.StringIO) -> Callable[..., None]:
@@ -275,12 +448,26 @@ def _run_exec(code: str) -> str:
 async def python_executor(code: str) -> str:
     """当需要进行数据处理、分析、可视化时使用，输入 Python 代码。
 
-    已预置 pandas（pd）与 numpy（np），不能 import，不能读写文件与网络。
+    已预置 pandas（pd）与 numpy（np），不能 import；文件读写、网络请求与反序列化入口
+    （read_* / to_* / load / save 等属性）已被拒绝，请只用内存中的数据结构完成分析。
     结果用 print 输出，或作为最后一行表达式（会回显取值）；例如：
     pd.Series([1, 2, 3]).mean().item()
+    代码有 15 秒执行上限（对死循环有效），请避免超大计算（如 9**20000000 这类巨型大整数）。
     """
     try:
-        return await asyncio.to_thread(_run_exec, code)
+        # 专用守护线程执行：不占用 asyncio 默认池（Chroma / 文档解析 / 文件写入共用），
+        # 卡死时只影响 python_executor 自身，不会拖垮其他接口
+        return await asyncio.wait_for(
+            _EXEC_POOL.run(_run_exec, code), timeout=_EXEC_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        # 线程无法强杀：超时的计算仍会在守护线程中继续跑，直到进程退出被回收。
+        # 注意超时是 best-effort——持有 GIL 的单次 C 级运算（如巨型大整数乘幂）会冻住
+        # 事件循环，定时器回调无法执行，此时超时不会生效（详见模块 docstring）。
+        return (
+            f"执行失败：代码运行超过 {_EXEC_TIMEOUT_SECONDS:.0f} 秒已中止"
+            "（可能是死循环或超大计算），请缩小计算规模后重试。"
+        )
     except Exception as exc:  # noqa: BLE001 — 模型生成代码的错误类型不可枚举，统一转为提示文本
         return f"执行失败：{type(exc).__name__}: {exc}"
 
