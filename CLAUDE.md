@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 > DataPilot 项目的 Claude Code 上下文基础文件：后续所有会话开工前，先读「重要约束」与「代码规范」。
-> 当前状态：llm 工厂、RAG（含检索测试接口，cosine 度量）、工具集、Agent 核心与 API 路由层（对话 / 知识库 / 模型 / 健康检查，test_api.py 全链路验证）均已实现并联网验证通过；前端脚手架、对话页（ChatView：SSE 流式 / 推理面板 / 会话管理）与知识库页（KnowledgeView：拖拽上传 / 文档列表 / 检索测试 / 删除清空，Edge headless 浏览器全流程验证通过）已实现；设置页为空壳。
+> 当前状态：llm 工厂、RAG（含检索测试接口，cosine 度量）、工具集、Agent 核心与 API 路由层（对话 / 知识库 / 模型 / 健康检查，test_api.py 全链路验证）均已实现并联网验证通过；前端脚手架、对话页（ChatView：SSE 流式 / 推理面板 / 会话管理）与知识库页（KnowledgeView：拖拽上传 / 文档列表 / 检索测试 / 删除清空，Edge headless 浏览器全流程验证通过）已实现；前后端联调通过（test_e2e.py 六项链路 + 浏览器四场景：流式回复 / 上传后检索 / 模型切换）；设置页为空壳。
 
 ## 1. 项目概述
 
@@ -48,6 +48,7 @@ DataPilot/
 │       ├── test_agent.py          # Agent 测试脚本（多步推理事件流 + run 契约 + 多轮记忆）
 │       ├── test_tools.py          # 工具测试脚本（计算器 / 代码执行 / 时间 / 知识库检索）
 │       ├── test_api.py            # API 测试脚本（需先启动后端；httpx 全链路：路由 / 上传 / 检索 / 删除 / 对话 / SSE）
+│       ├── test_e2e.py            # 端到端联调脚本（httpx：健康 / 模型 / 对话 / 上传 / RAG 问答 / 多步推理）
 │       ├── llm/                   # 模型工厂：get_model / get_embeddings（已实现）
 │       ├── rag/                   # RAG：pypdfium2 解析 → 切分 → Chroma 入库与检索（RagService，已实现）
 │       ├── agent/                 # create_agent 组装 + DataAnalysisAgent 类封装 + 系统提示词；events.py 事件流适配（均已实现）
@@ -86,6 +87,7 @@ uv run python src/test_rag.py                 # RAG 测试（解析/切分离线
 uv run python src/test_agent.py               # Agent 测试（多步推理 + run 契约 + 多轮记忆，需 Key）
 uv run python src/test_tools.py               # 工具测试（仅检索需 Key，其余离线）
 uv run python src/test_api.py                 # API 测试（需后端已启动；上传/对话需 Key）
+uv run python src/test_e2e.py                 # 端到端联调测试（需后端已启动；对话/RAG 需 Key）
 
 # ===== 前端 =====
 cd front
