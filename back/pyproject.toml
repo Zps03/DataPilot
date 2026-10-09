@@ -8,7 +8,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "chromadb>=1.5.9",
-    "fastapi>=0.141.1",
+    "fastapi==0.143.0",
     "httpx>=0.28.1",
     "httpx-sse>=0.4.3",
     "langchain>=1.4.2",
@@ -40,9 +40,18 @@ default = true
 line-length = 100
 target-version = "py313"
 
+[tool.ruff.lint.isort]
+known-first-party = ["utils"]  # tests/ 公共工具（经 tests/ 目录直接导入，不在 src 源根下）
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"  # 异步 fixture 用函数级事件循环（显式声明，防隐式回退）
 pythonpath = ["src"]  # pytest 从 back/ 运行时，将源代码根加入导入路径
+testpaths = ["tests"]  # 仅收集 tests/（src/ 下 test_*.py 是可独立运行的脚本，不是 pytest 用例）
+addopts = "--strict-markers"
+markers = [
+    "online: 需要 DASHSCOPE_API_KEY 与公网（LLM / Embedding 调用），未配置时自动跳过",
+]
 
 [dependency-groups]
 dev = [

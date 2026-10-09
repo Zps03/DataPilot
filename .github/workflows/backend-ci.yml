@@ -1,0 +1,35 @@
+# 后端 CI：ruff（lint + 格式）+ pytest 测试套件。
+# 测试由 conftest 自动拉起 uvicorn 子进程；online 标记用例需要仓库 Secret
+# DASHSCOPE_API_KEY（Settings → Secrets and variables → Actions 中配置），
+# 未配置时为空字符串，联网用例自动跳过，离线用例仍全量运行。
+name: backend-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: back
+    env:
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: 同步依赖（按 uv.lock）
+        run: uv sync --frozen
+      - name: Lint（ruff check + format --check）
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: 测试（pytest）
+        run: uv run pytest -v
